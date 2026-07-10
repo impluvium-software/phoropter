@@ -49,8 +49,6 @@ jobs:
       - name: Install
         run: pip install -e . --group dev
       - name: Gates (prefix property, parity)
-        shell: bash
-        # Exit code 5 = no tests collected; tolerated only until the gate suite lands.
-        run: pytest -m gate --exitfirst || { rc=$?; [ "$rc" -eq 5 ] && echo "no gate tests collected yet"; [ "$rc" -eq 5 ]; }
+        run: pytest -m gate --exitfirst
       - name: Unit tests
         run: pytest

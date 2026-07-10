@@ -149,8 +149,13 @@ source_modules = [
   "phorapter.fusion",
   "phorapter.selection",
   "phorapter.trace",
+  "phorapter.tokens",
   "phorapter.stores.memory",
 ]
+# The single sanctioned exception: tokens.py imports tiktoken lazily inside
+# functions. A stripped-env test asserts the laziness; everything else here
+# stays forbidden.
+ignore_imports = ["phorapter.tokens -> tiktoken"]
 forbidden_modules = [
   "fastapi",
   "pydantic",
