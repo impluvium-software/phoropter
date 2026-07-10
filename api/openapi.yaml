@@ -1,0 +1,1097 @@
+openapi: 3.1.0
+info:
+  title: Phorapter
+  version: "1.0"
+  description: |
+    Phorapter is a multi-view retrieval server. It indexes every document at
+    several slice sizes on a shared origin-aligned grid, and — given a query and
+    an optional token budget — returns *right-sized* context: contained
+    duplicates are discarded, and small hits are traded up to their enclosing
+    parent slices while the budget allows.
+
+    Slicing, indexing, and query configuration are frozen once, at corpus
+    creation, into the store; the server itself is stateless. Retrieval fans out
+    across sizes and tolerates partial failure: if at least one size answers, the
+    query succeeds with `partial: true`; only when every size is down does the
+    query return 503.
+
+    All errors share one envelope — `{ "error": { code, message, details,
+    request_id } }` — and every error carries a stable machine-readable `code`.
+  license:
+    name: MIT
+
+servers:
+  - url: /
+    description: This server.
+
+tags:
+  - name: health
+    description: Liveness, readiness, and build metadata.
+  - name: corpora
+    description: Corpus lifecycle. Grid, embedder, and tokenizer are frozen at creation.
+  - name: documents
+    description: Document ingest, replace, inspect, and delete within a corpus.
+  - name: query
+    description: Multi-size retrieval and token-budgeted right-sizing.
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      description: Returns 200 as long as the process is running. Does not touch the store.
+      operationId: liveness
+      security: []
+      responses:
+        "200":
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Liveness"
+
+  /v1/health:
+    get:
+      tags: [health]
+      summary: Readiness probe
+      description: |
+        Reports whether the store and embedder are reachable. Returns 200 with a
+        `status` of `ok` or `degraded`; a hard dependency failure surfaces as 503.
+      operationId: readiness
+      security: []
+      responses:
+        "200":
+          description: Readiness detail.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Readiness"
+        "503":
+          description: A required dependency is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /v1/info:
+    get:
+      tags: [health]
+      summary: Build and registry metadata
+      description: Version, configured store and embedder, and the registered adapter names.
+      operationId: info
+      responses:
+        "200":
+          description: Server metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Info"
+
+  /v1/corpora:
+    get:
+      tags: [corpora]
+      summary: List corpora
+      operationId: listCorpora
+      responses:
+        "200":
+          description: The names of all corpora, sorted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CorpusList"
+        "503":
+          description: The store is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+    post:
+      tags: [corpora]
+      summary: Create a corpus
+      description: |
+        Creates a corpus and freezes its configuration. The grid, embedder pin,
+        vector dimension (probed from the embedder), and tokenizer are written
+        once and are immutable thereafter. Omitted fields fall back to the
+        server's configured defaults.
+      operationId: createCorpus
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCorpusRequest"
+            examples:
+              minimal:
+                summary: Name only; everything else from server defaults
+                value:
+                  name: handbook
+      responses:
+        "201":
+          description: The corpus was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Corpus"
+        "409":
+          description: A corpus with this name already exists.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
+          description: The request or the pinned tokenizer is invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "503":
+          description: The store or embedder is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /v1/corpora/{corpus}:
+    parameters:
+      - $ref: "#/components/parameters/CorpusPath"
+    get:
+      tags: [corpora]
+      summary: Inspect a corpus
+      description: The frozen configuration plus current document and per-size point counts.
+      operationId: getCorpus
+      responses:
+        "200":
+          description: The corpus record.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Corpus"
+        "404":
+          description: No such corpus.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+    delete:
+      tags: [corpora]
+      summary: Drop a corpus
+      description: Removes the corpus, its points, its document registry, and its config.
+      operationId: dropCorpus
+      responses:
+        "204":
+          description: The corpus was dropped.
+        "404":
+          description: No such corpus.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /v1/corpora/{corpus}/documents:
+    parameters:
+      - $ref: "#/components/parameters/CorpusPath"
+    get:
+      tags: [documents]
+      summary: List documents
+      description: One cursor-paginated page of document records.
+      operationId: listDocuments
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: One page of document records.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentPage"
+        "404":
+          description: No such corpus.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /v1/corpora/{corpus}/documents/batch:
+    parameters:
+      - $ref: "#/components/parameters/CorpusPath"
+    post:
+      tags: [documents]
+      summary: Add or replace up to a bounded number of documents
+      description: |
+        Ingests a batch of documents. Each is sliced, embedded, and upserted
+        idempotently; orphaned slices from a shrunk replacement are tombstoned.
+        The response carries a per-document status so a partial batch is legible.
+      operationId: batchDocuments
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchDocumentsRequest"
+      responses:
+        "200":
+          description: Per-document ingest statuses.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchDocumentsResponse"
+        "404":
+          description: No such corpus.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "413":
+          description: The batch exceeds the configured document limit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
+          description: The batch is malformed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /v1/corpora/{corpus}/documents/{document_id}:
+    parameters:
+      - $ref: "#/components/parameters/CorpusPath"
+      - $ref: "#/components/parameters/DocumentIdPath"
+    put:
+      tags: [documents]
+      summary: Add or replace a document
+      description: |
+        Idempotent, synchronous full re-slice. Deterministic ids make a repeat
+        ingest an in-place upsert; a shrunk replacement tombstones exactly the
+        orphaned slices.
+      operationId: putDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PutDocumentRequest"
+            examples:
+              simple:
+                value:
+                  text: "The quick brown fox jumps over the lazy dog."
+      responses:
+        "200":
+          description: The document was ingested.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentRecord"
+        "404":
+          description: No such corpus.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "413":
+          description: The document exceeds the configured code-point limit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
+          description: The document cannot be sliced.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+    get:
+      tags: [documents]
+      summary: Inspect a document
+      operationId: getDocument
+      responses:
+        "200":
+          description: The document record.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentRecord"
+        "404":
+          description: No such corpus or document.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+    delete:
+      tags: [documents]
+      summary: Delete a document
+      description: Removes the document's points and its registry entry.
+      operationId: deleteDocument
+      responses:
+        "204":
+          description: The document was deleted.
+        "404":
+          description: No such corpus or document.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /v1/corpora/{corpus}/query:
+    parameters:
+      - $ref: "#/components/parameters/CorpusPath"
+    post:
+      tags: [query]
+      summary: Retrieve and right-size context
+      description: |
+        Embeds the query once, fans out a top-k search per grid size, fuses the
+        results, builds the containment forest, and runs the selection strategy
+        under the token budget. A partial fan-out (at least one size answered)
+        returns 200 with `partial: true`; only a total fan-out failure returns
+        503. A budget too small to fit anything returns 200 with an empty result
+        set and a warning, never an error.
+      operationId: query
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+            examples:
+              budgeted:
+                value:
+                  query: "how do I rotate the signing key?"
+                  token_budget: 800
+      responses:
+        "200":
+          description: The right-sized selection and its trace.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+        "404":
+          description: No such corpus.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
+          description: The request or an overridden tokenizer is invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "503":
+          description: Every size fan-out failed, or the embedder is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Optional static bearer token. When the server is configured with an API
+        key, every endpoint except the liveness and readiness probes requires
+        `Authorization: Bearer <token>`. When no key is configured, auth is off.
+
+  parameters:
+    CorpusPath:
+      name: corpus
+      in: path
+      required: true
+      description: Corpus name.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    DocumentIdPath:
+      name: document_id
+      in: path
+      required: true
+      description: Document identifier (opaque, caller-chosen).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+
+  schemas:
+    Liveness:
+      type: object
+      description: Liveness result.
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+      additionalProperties: false
+
+    Readiness:
+      type: object
+      description: Readiness detail across dependencies.
+      required: [status, store, embedder]
+      properties:
+        status:
+          type: string
+          description: Overall readiness.
+          enum: [ok, degraded]
+        store:
+          type: boolean
+          description: Whether the vector store is reachable.
+        embedder:
+          type: boolean
+          description: Whether the embedder is reachable.
+        detail:
+          type: string
+          description: Human-readable explanation when degraded.
+      additionalProperties: false
+
+    Info:
+      type: object
+      description: Build and registry metadata.
+      required: [name, version, store, embedder, stores_available]
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+        store:
+          type: string
+          description: The configured store kind.
+        embedder:
+          type: string
+          description: The configured embedder pin (`provider:model`).
+        stores_available:
+          type: array
+          description: Store adapter names registered under the plugin group.
+          items:
+            type: string
+        embedders_available:
+          type: array
+          description: Embedder provider names registered under the plugin group.
+          items:
+            type: string
+      additionalProperties: false
+
+    GridSpec:
+      type: object
+      description: A validated ladder of slice sizes (code points), ascending, each dividing the next.
+      required: [sizes]
+      properties:
+        sizes:
+          type: array
+          minItems: 1
+          items:
+            type: integer
+      additionalProperties: false
+
+    CreateCorpusRequest:
+      type: object
+      description: Corpus creation. Omitted fields fall back to server defaults.
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Corpus name; unique within the store.
+        grid_sizes:
+          type: array
+          description: Grid sizes in code points. Defaults to the server's configured grid.
+          items:
+            type: integer
+        tokenizer:
+          type: string
+          description: Token counter id (e.g. `tiktoken:o200k_base`). Force-materialized at creation.
+        embedder_provider:
+          type: string
+          description: Embedder provider override; defaults to the server's configured provider.
+        embedder_model:
+          type: string
+          description: Embedder model override; defaults to the server's configured model.
+      additionalProperties: false
+
+    Corpus:
+      type: object
+      description: A corpus with its frozen configuration and current counts.
+      required:
+        [name, grid, embedder, dimension, tokenizer, document_count, points_by_size, degraded]
+      properties:
+        name:
+          type: string
+        grid:
+          $ref: "#/components/schemas/GridSpec"
+        embedder:
+          type: string
+          description: The pinned embedder fingerprint (`provider:model`).
+        dimension:
+          type: integer
+          description: The embedding dimension probed at creation.
+        tokenizer:
+          type: string
+          description: The pinned token counter id.
+        document_count:
+          type: integer
+        points_by_size:
+          type: array
+          description: Per-size point counts, ascending by size.
+          items:
+            $ref: "#/components/schemas/SizeCount"
+        degraded:
+          type: array
+          description: Degradation reasons; an empty list means healthy.
+          items:
+            type: string
+      additionalProperties: false
+
+    SizeCount:
+      type: object
+      required: [size, count]
+      properties:
+        size:
+          type: integer
+        count:
+          type: integer
+      additionalProperties: false
+
+    CorpusList:
+      type: object
+      required: [corpora]
+      properties:
+        corpora:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+
+    DocumentMetadataEntry:
+      type: object
+      description: One caller-supplied metadata key/value pair.
+      required: [key, value]
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+      additionalProperties: false
+
+    PutDocumentRequest:
+      type: object
+      description: A document to add or replace.
+      required: [text]
+      properties:
+        text:
+          type: string
+          description: The full document text. Never normalized.
+        metadata:
+          type: array
+          description: Caller-supplied metadata, preserved as an ordered list of pairs.
+          items:
+            $ref: "#/components/schemas/DocumentMetadataEntry"
+      additionalProperties: false
+
+    BatchDocumentItem:
+      type: object
+      description: One document in a batch, keyed by its id.
+      required: [document_id, text]
+      properties:
+        document_id:
+          type: string
+          minLength: 1
+          maxLength: 512
+        text:
+          type: string
+        metadata:
+          type: array
+          items:
+            $ref: "#/components/schemas/DocumentMetadataEntry"
+      additionalProperties: false
+
+    BatchDocumentsRequest:
+      type: object
+      required: [documents]
+      properties:
+        documents:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/BatchDocumentItem"
+      additionalProperties: false
+
+    BatchDocumentStatus:
+      type: object
+      description: The outcome for one document in a batch.
+      required: [document_id, ok]
+      properties:
+        document_id:
+          type: string
+        ok:
+          type: boolean
+        record:
+          $ref: "#/components/schemas/DocumentRecord"
+        error:
+          $ref: "#/components/schemas/ErrorDetail"
+      additionalProperties: false
+
+    BatchDocumentsResponse:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/BatchDocumentStatus"
+      additionalProperties: false
+
+    DocumentRecord:
+      type: object
+      description: The registry entry for one ingested document.
+      required: [document_id, codepoint_length, byte_length, slice_count, content_marker]
+      properties:
+        document_id:
+          type: string
+        codepoint_length:
+          type: integer
+        byte_length:
+          type: integer
+        slice_count:
+          type: integer
+        content_marker:
+          type: string
+          description: SHA-256 (64 lowercase hex) of the full document text.
+        metadata:
+          type: array
+          items:
+            $ref: "#/components/schemas/DocumentMetadataEntry"
+      additionalProperties: false
+
+    DocumentPage:
+      type: object
+      description: One page of a cursor-paginated document listing.
+      required: [records]
+      properties:
+        records:
+          type: array
+          items:
+            $ref: "#/components/schemas/DocumentRecord"
+        next_cursor:
+          type: [string, "null"]
+          description: Opaque cursor for the next page; null when the listing is complete.
+      additionalProperties: false
+
+    QueryRequest:
+      type: object
+      description: A retrieval-and-right-size request.
+      required: [query]
+      properties:
+        query:
+          type: string
+          minLength: 1
+          description: The natural-language query, embedded once.
+        token_budget:
+          type: [integer, "null"]
+          minimum: 0
+          description: >-
+            Token budget for the returned context. Omitted or null means dedup
+            only (no trade-up). Capped by the server's maximum budget.
+        top_k_per_size:
+          type: integer
+          minimum: 1
+          default: 10
+          description: Top-k retrieved per grid size before fusion.
+        strategy:
+          type: string
+          default: greedy_upward
+          description: Selection strategy name.
+        expansion:
+          type: string
+          enum: [fill, retrieved_only, "off"]
+          default: fill
+          description: Trade-up mode.
+        sizes:
+          type: array
+          description: Restrict the fan-out to these grid sizes; defaults to all sizes.
+          items:
+            type: integer
+        tokenizer:
+          type: string
+          description: Override the corpus tokenizer for this request (counts recomputed on the fly).
+        max_slice_size:
+          type: [integer, "null"]
+          description: Cap on how large a traded-up slice may grow.
+        include_text:
+          type: boolean
+          default: true
+          description: Include slice text in results.
+        include_trace:
+          type: boolean
+          default: true
+          description: Include the full substitution trace.
+      additionalProperties: false
+
+    QueryResponse:
+      type: object
+      description: The right-sized selection.
+      required: [corpus, strategy, budget, partial, results]
+      properties:
+        corpus:
+          type: string
+        strategy:
+          type: string
+        budget:
+          $ref: "#/components/schemas/BudgetReport"
+        partial:
+          type: boolean
+          description: True when at least one size fan-out failed but the query still succeeded.
+        fanout:
+          type: array
+          description: Per-size fan-out status.
+          items:
+            $ref: "#/components/schemas/FanoutStatus"
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/QueryResult"
+        trace:
+          $ref: "#/components/schemas/SubstitutionTrace"
+        warnings:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+
+    BudgetReport:
+      type: object
+      description: Budget arithmetic for the selection.
+      required: [used, counter]
+      properties:
+        limit:
+          type: [integer, "null"]
+          description: The effective budget cap; null when unbounded (dedup only).
+        used:
+          type: integer
+          description: Tokens the selection consumed.
+        counter:
+          type: string
+          description: The token counter id under which usage was measured.
+      additionalProperties: false
+
+    FanoutStatus:
+      type: object
+      description: Whether one size fan-out succeeded.
+      required: [size, ok]
+      properties:
+        size:
+          type: integer
+        ok:
+          type: boolean
+        hits:
+          type: integer
+          description: Number of hits returned by this size (0 when it failed).
+        error:
+          type: [string, "null"]
+          description: Failure reason when this size did not answer.
+      additionalProperties: false
+
+    SliceCoords:
+      type: object
+      description: The identity and geometry of one slice.
+      required:
+        [document_id, size, codepoint_offset, codepoint_length, codepoint_end, own_marker]
+      properties:
+        document_id:
+          type: string
+        size:
+          type: integer
+        codepoint_offset:
+          type: integer
+        codepoint_length:
+          type: integer
+        codepoint_end:
+          type: integer
+        own_marker:
+          type: string
+          description: SHA-256 (64 lowercase hex) of the slice's UTF-8 bytes.
+      additionalProperties: false
+
+    RetrievalInfo:
+      type: object
+      description: How a slice was retrieved. Score is null for a traded-up slice — never fabricated.
+      required: [retrieved]
+      properties:
+        retrieved:
+          type: boolean
+          description: True when this exact slice was itself a retrieval hit.
+        rank_in_size:
+          type: [integer, "null"]
+          description: 0-based rank within its size, or null if not retrieved.
+        score:
+          type: [number, "null"]
+          description: Raw store score (ordinal within one size only), or null.
+      additionalProperties: false
+
+    SelectionInfo:
+      type: object
+      description: What the selection engine did with this slice.
+      required: [action, replaced, levels]
+      properties:
+        action:
+          type: string
+          enum: [kept, traded_up]
+        replaced:
+          type: array
+          description: Ids of slices this one replaced or subsumed.
+          items:
+            type: string
+        levels:
+          type: integer
+          description: How many grid levels this slice was traded up.
+      additionalProperties: false
+
+    EvidenceItem:
+      type: object
+      description: A genuine retrieval that supports a selected slice.
+      required: [id, size, codepoint_offset, fused_rank]
+      properties:
+        id:
+          type: string
+        size:
+          type: integer
+        codepoint_offset:
+          type: integer
+        score:
+          type: [number, "null"]
+          description: Raw within-size score of this supporting hit.
+        rank_in_size:
+          type: [integer, "null"]
+        fused_rank:
+          type: integer
+      additionalProperties: false
+
+    QueryResult:
+      type: object
+      description: One slice in the right-sized selection.
+      required:
+        [id, coords, token_count, provenance, effective_rank, contiguous_with_next, retrieval, selection, evidence]
+      properties:
+        id:
+          type: string
+          description: The slice's deterministic id.
+        coords:
+          $ref: "#/components/schemas/SliceCoords"
+        text:
+          type: [string, "null"]
+          description: The slice text; null when text was not requested.
+        token_count:
+          type: [integer, "null"]
+        provenance:
+          type: string
+          enum: [retrieved, traded_up]
+        effective_rank:
+          type: integer
+          description: Best fused rank across this slice's evidence.
+        contiguous_with_next:
+          type: boolean
+          description: True when the next result immediately follows this slice in the same document.
+        retrieval:
+          $ref: "#/components/schemas/RetrievalInfo"
+        selection:
+          $ref: "#/components/schemas/SelectionInfo"
+        evidence:
+          type: array
+          items:
+            $ref: "#/components/schemas/EvidenceItem"
+      additionalProperties: false
+
+    SubstitutionTrace:
+      type: object
+      description: The full lifecycle record of one selection run — the explainability contract.
+      required: [fusion, forest, dedup, initial_pack, trade_ups, rejections, final]
+      properties:
+        fusion:
+          $ref: "#/components/schemas/FusionTrace"
+        forest:
+          $ref: "#/components/schemas/ForestTrace"
+        dedup:
+          type: array
+          items:
+            $ref: "#/components/schemas/DedupEntry"
+        initial_pack:
+          $ref: "#/components/schemas/InitialPackTrace"
+        trade_ups:
+          type: array
+          items:
+            $ref: "#/components/schemas/TradeUpEntry"
+        rejections:
+          type: array
+          items:
+            $ref: "#/components/schemas/RejectionEntry"
+        final:
+          $ref: "#/components/schemas/FinalTrace"
+        warnings:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+
+    FusionTrace:
+      type: object
+      required: [sizes, candidate_count]
+      properties:
+        sizes:
+          type: array
+          items:
+            type: integer
+        candidate_count:
+          type: integer
+      additionalProperties: false
+
+    ForestTrace:
+      type: object
+      required:
+        [hit_count, edge_count, anomaly_count, participation_rate, max_depth]
+      properties:
+        hit_count:
+          type: integer
+        edge_count:
+          type: integer
+        anomaly_count:
+          type: integer
+        participation_rate:
+          type: number
+        max_depth:
+          type: integer
+      additionalProperties: false
+
+    DedupEntry:
+      type: object
+      required: [kept_id, dropped_ids]
+      properties:
+        kept_id:
+          type: string
+        dropped_ids:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+
+    SkippedUnaffordable:
+      type: object
+      required: [id, tokens, budget_left]
+      properties:
+        id:
+          type: string
+        tokens:
+          type: integer
+        budget_left:
+          type: integer
+      additionalProperties: false
+
+    InitialPackTrace:
+      type: object
+      required: [selected_ids, skipped_unaffordable]
+      properties:
+        selected_ids:
+          type: array
+          items:
+            type: string
+        skipped_unaffordable:
+          type: array
+          items:
+            $ref: "#/components/schemas/SkippedUnaffordable"
+        smallest_unaffordable_tokens:
+          type: [integer, "null"]
+      additionalProperties: false
+
+    TradeUpEntry:
+      type: object
+      required: [round, from_id, to_id, to_provenance, subsumed_ids, delta_tokens, budget_left]
+      properties:
+        round:
+          type: integer
+        from_id:
+          type: string
+        to_id:
+          type: string
+        to_provenance:
+          type: string
+          enum: [retrieved, fetched]
+        subsumed_ids:
+          type: array
+          items:
+            type: string
+        delta_tokens:
+          type: integer
+        budget_left:
+          type: integer
+      additionalProperties: false
+
+    RejectionEntry:
+      type: object
+      required: [round, target_id, reason]
+      properties:
+        round:
+          type: integer
+        target_id:
+          type: string
+        reason:
+          type: string
+          enum: [over_budget, stale_parent, fetch_miss, saturated]
+        delta_tokens:
+          type: [integer, "null"]
+      additionalProperties: false
+
+    FinalTrace:
+      type: object
+      required: [tokens_used, budget_exhausted]
+      properties:
+        tokens_used:
+          type: integer
+        budget:
+          type: [integer, "null"]
+        utilization:
+          type: [number, "null"]
+        budget_exhausted:
+          type: boolean
+      additionalProperties: false
+
+    ErrorDetail:
+      type: object
+      description: The error payload inside the envelope.
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error code.
+        message:
+          type: string
+        details:
+          type: [object, "null"]
+          additionalProperties: true
+        request_id:
+          type: [string, "null"]
+          description: The request id, echoed for correlation.
+      additionalProperties: false
+
+    ErrorEnvelope:
+      type: object
+      description: The uniform error envelope wrapping every non-2xx response.
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorDetail"
+      additionalProperties: false
+
+security:
+  - bearerAuth: []
