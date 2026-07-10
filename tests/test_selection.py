@@ -279,20 +279,102 @@ def test_properties_hold(data, budget: int) -> None:
     # Never exceeds budget.
     assert sel.tokens_used <= budget
 
-    # Substitutions are strictly upward: a traded-up slice is larger than every id
-    # it replaced.
-    by_ref_size = {s.ref: s.size for s in all_slices}
+    # Substitutions are information-preserving: a selected slice's span must
+    # actually CONTAIN every slice it replaced (larger size AND covering offsets),
+    # not merely be larger. This is the guard against marker-collision false
+    # subsumption on repeated text.
+    by_id = {str(s.ref.uuid()): s for s in all_slices}
     for selected in sel.slices:
         for replaced_id in selected.replaced_ids:
-            replaced_size = next(
-                (sz for ref, sz in by_ref_size.items() if str(ref.uuid()) == replaced_id), None
-            )
-            if replaced_size is not None:
-                assert selected.slice.size > replaced_size
+            replaced = by_id.get(replaced_id)
+            if replaced is None:
+                continue
+            assert selected.slice.size > replaced.size
+            assert selected.slice.document_id == replaced.document_id
+            # The replaced slice's span must lie inside the selected slice's span.
+            # (This is the property-level guard against marker-collision false
+            # subsumption: a disjoint same-text slice would violate it.)
+            assert selected.slice.codepoint_offset <= replaced.codepoint_offset
+            assert replaced.codepoint_end <= selected.slice.codepoint_end
 
     # The lifecycle invariant is machine-checkable and holds.
     assert sel.trace.replay_top_ids() == {s.id for s in sel.slices}
 
-    # Determinism: a re-run is byte-identical.
+    # Determinism: a re-run is byte-identical, trace included.
     again = budget_fit(hits, budget=budget, counter=CharCounter(), source=DictSource(all_slices))
     assert [s.id for s in again.slices] == [s.id for s in sel.slices]
+    assert repr(again.trace) == repr(sel.trace)
+
+
+class TestRepeatedTextSubsumption:
+    """Regression: repeated text must not fabricate a subsumption in trade-up.
+
+    Byte-identical slices at disjoint offsets share a marker, so the parent's
+    descendant-marker list vouches for a slice it does not enclose. Subsumption
+    must decide containment positionally, not by marker alone.
+    """
+
+    def test_disjoint_repeated_leaf_is_not_absorbed(self) -> None:
+        doc = multi_view_slice("doc-a", "x" * 1024, DEFAULT_GRID)
+        # Two disjoint 64 leaves; the second is far outside the 128@0 parent.
+        hits = [make_hit(doc, 64, 0, 0.95), make_hit(doc, 64, 192, 0.90)]
+        source = DictSource([doc.slice_at(128, 0)])
+        sel = budget_fit(hits, budget=200, counter=CharCounter(), source=source)
+        # 64@0 trades up to 128@0 ([0,128)); 64@192 ([192,256)) must survive.
+        spans = sorted((s.slice.size, s.slice.codepoint_offset) for s in sel.slices)
+        assert spans == [(64, 192), (128, 0)]
+        # The region [192,256) is still covered.
+        assert any(
+            s.slice.codepoint_offset == 192 and s.slice.codepoint_end == 256 for s in sel.slices
+        )
+
+    def test_many_disjoint_repeated_leaves_all_survive(self) -> None:
+        doc = multi_view_slice("doc-a", "x" * 1024, DEFAULT_GRID)
+        offsets = [0, 128, 256, 384, 512, 640, 768, 896]
+        hits = [make_hit(doc, 64, o, 0.9 - i * 0.01) for i, o in enumerate(offsets)]
+        source = DictSource([doc.slice_at(128, 0)])
+        sel = budget_fit(hits, budget=10000, counter=CharCounter(), source=source)
+        # 64@0 -> 128@0 covers [0,128); the other seven disjoint leaves remain.
+        assert len(sel.slices) == 8
+        covered_ends = {s.slice.codepoint_end for s in sel.slices}
+        assert covered_ends == {128, 192, 320, 448, 576, 704, 832, 960}
+
+
+class TestTraceDeterminism:
+    def test_dedup_trace_order_independent_of_input_order(self) -> None:
+        doc = multi_view_slice("doc-a", "".join(chr(0x100 + i) for i in range(1024)), DEFAULT_GRID)
+        base = [
+            make_hit(doc, 64, 0, 0.9),
+            make_hit(doc, 128, 0, 0.8),
+            make_hit(doc, 64, 512, 0.7),
+            make_hit(doc, 128, 512, 0.6),
+        ]
+        a = budget_fit(
+            base, budget=5000, counter=CharCounter(), options=SelectionOptions(expansion="off")
+        )
+        b = budget_fit(
+            list(reversed(base)),
+            budget=5000,
+            counter=CharCounter(),
+            options=SelectionOptions(expansion="off"),
+        )
+        assert repr(a.trace) == repr(b.trace)
+
+
+class TestJoinOverhead:
+    def test_overhead_counted_against_budget(self) -> None:
+        doc = multi_view_slice("doc-a", "".join(chr(0x100 + i) for i in range(1024)), DEFAULT_GRID)
+        # Three disjoint 128 leaves, each 128 tokens + 40 overhead = 168; budget 520
+        # admits three (504) but not with any trade-up headroom.
+        hits = [make_hit(doc, 128, o, 0.9) for o in (0, 256, 512)]
+        sel = budget_fit(
+            hits,
+            budget=520,
+            counter=CharCounter(),
+            options=SelectionOptions(expansion="off", join_overhead_tokens=40),
+        )
+        assert len(sel.slices) == 3
+        # tokens_used includes the per-slice overhead and stays within budget.
+        assert sel.tokens_used == 3 * (128 + 40)
+        assert sel.tokens_used <= 520
+        assert sel.trace.final.utilization == sel.tokens_used / 520

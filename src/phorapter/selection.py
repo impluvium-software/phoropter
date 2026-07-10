@@ -309,10 +309,14 @@ class GreedyUpwardStrategy:
                 )
 
         classes.sort(key=lambda c: c.priority())
+        # Canonical trace order, independent of input hit order (determinism).
+        dedup_entries.sort(
+            key=lambda d: (d.kept_ref.document_id, d.kept_ref.size, d.kept_ref.codepoint_offset)
+        )
 
         # ── budget=None: dedup only, no packing or trade-up ─────────────────
         if request.budget is None:
-            tokens_used = sum(tokens(c.top) for c in classes)
+            tokens_used = sum(cost(c.top) for c in classes)
             initial_pack = InitialPackTrace(
                 selected_ids=tuple(c.top_id for c in classes),
                 skipped_unaffordable=(),
@@ -373,7 +377,9 @@ class GreedyUpwardStrategy:
             )
 
         alive = [c for c in packed if c.alive]
-        tokens_used = sum(tokens(c.top) for c in alive)
+        # tokens_used is the quantity the budget bounds: slice tokens plus the
+        # join overhead charged per selected slice (0 by default).
+        tokens_used = sum(cost(c.top) for c in alive)
         budget_exhausted = bool(skipped) or any(r.reason == "over_budget" for r in rejections)
         final = FinalTrace(
             tokens_used=tokens_used,
@@ -482,7 +488,12 @@ class GreedyUpwardStrategy:
                     continue
 
                 # Subsumption: other alive classes whose top the parent encloses
-                # (or that already sit on the parent), marker-verified.
+                # (or that already sit on the parent). Containment is decided
+                # POSITIONALLY (the parent's span must cover the other top) and
+                # only then verified by the marker — the same order the forest
+                # uses. Deciding by marker alone would let repeated text (whose
+                # byte-identical slices share a marker at disjoint offsets) be
+                # falsely absorbed and dropped.
                 subsumed = [
                     other
                     for other in packed
@@ -493,6 +504,8 @@ class GreedyUpwardStrategy:
                         or (
                             other.top.document_id == parent.document_id
                             and parent.size > other.top.size
+                            and parent.codepoint_offset <= other.top.codepoint_offset
+                            and other.top.codepoint_end <= parent.codepoint_end
                             and other.top.own_marker in parent.descendant_markers
                         )
                     )
