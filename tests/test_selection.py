@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -12,6 +14,11 @@ from phoropter.selection import (
     SelectionOptions,
     budget_fit,
 )
+
+
+def _distinct(n: int) -> str:
+    """A string whose every code point is unique, so every slice has a unique marker."""
+    return "".join(chr(0x100 + i) for i in range(n))
 
 
 class CharCounter:
@@ -378,3 +385,78 @@ class TestJoinOverhead:
         assert sel.tokens_used == 3 * (128 + 40)
         assert sel.tokens_used <= 520
         assert sel.trace.final.utilization == sel.tokens_used / 520
+
+
+class TestSubsumptionCorrectness:
+    """Trade-up subsumption must decide containment positionally AND per-document,
+    verified by markers — never by marker membership or numeric range alone.
+    Each test is built to fail against a specific known-survivable mutation.
+    """
+
+    def test_cross_document_slice_never_subsumed(self) -> None:
+        # Two documents of identical boilerplate share every marker. A parent from
+        # doc-a must never absorb doc-b's slice, though their markers/ranges match.
+        # (Kills deleting the `document_id ==` guard in the subsumption predicate.)
+        a = multi_view_slice("doc-a", "x" * 1024, DEFAULT_GRID)
+        b = multi_view_slice("doc-b", "x" * 1024, DEFAULT_GRID)
+        hits = [make_hit(a, 64, 0, 0.95), make_hit(a, 64, 64, 0.90), make_hit(b, 64, 0, 0.85)]
+        sel = budget_fit(
+            hits, budget=100000, counter=CharCounter(), source=DictSource([a.slice_at(128, 0)])
+        )
+        kept = {(s.slice.document_id, s.slice.size, s.slice.codepoint_offset) for s in sel.slices}
+        assert ("doc-b", 64, 0) in kept  # doc-b's content was not silently dropped
+        assert ("doc-a", 128, 0) in kept  # doc-a's leaves collapsed into their parent
+
+    def test_subsumes_sibling_at_parent_left_edge(self) -> None:
+        # A sibling exactly at the parent's left edge (offset == parent offset) must
+        # still be absorbed. (Kills the `parent.offset <= other.offset` -> `<` mutant.)
+        doc = multi_view_slice("d", _distinct(256), DEFAULT_GRID)
+        hits = [make_hit(doc, 64, 64, 0.95), make_hit(doc, 64, 0, 0.90)]
+        sel = budget_fit(
+            hits, budget=100000, counter=CharCounter(), source=DictSource([doc.slice_at(128, 0)])
+        )
+        # The 64@64 -> 128@0 trade itself must absorb 64@0 (at the edge), in that step.
+        from_id = str(doc.slice_at(64, 64).ref.uuid())
+        edge_id = str(doc.slice_at(64, 0).ref.uuid())
+        trade = next(t for t in sel.trace.trade_ups if t.from_id == from_id)
+        assert edge_id in trade.subsumed_ids
+
+    def test_stale_sibling_not_subsumed(self) -> None:
+        # A sibling positionally inside the parent whose marker the parent does NOT
+        # vouch for (a stale generation) must not be absorbed. (Kills deleting the
+        # `other.top.own_marker in parent.descendant_markers` conjunct.)
+        doc = multi_view_slice("d", _distinct(256), DEFAULT_GRID)
+        # Parent vouches for 64@64 (the trader) but not for 64@0 (the stale sibling).
+        parent = dataclasses.replace(
+            doc.slice_at(128, 0), descendant_markers=(doc.slice_at(64, 64).own_marker,)
+        )
+        hits = [make_hit(doc, 64, 64, 0.95), make_hit(doc, 64, 0, 0.90)]
+        sel = budget_fit(hits, budget=100000, counter=CharCounter(), source=DictSource([parent]))
+        kept = {(s.slice.size, s.slice.codepoint_offset) for s in sel.slices}
+        assert (64, 0) in kept  # not absorbed, and it could not trade up itself
+
+    def test_over_budget_class_does_not_abort_the_round(self) -> None:
+        # In one round, a class too expensive to trade must not stop a cheaper,
+        # lower-priority class from trading the same round. (Kills the over-budget
+        # `continue` -> `break` mutant, which defers the cheaper class a round.)
+        doc = multi_view_slice("d", _distinct(1024), DEFAULT_GRID)
+
+        def tok(size, offset, n):
+            return dataclasses.replace(doc.slice_at(size, offset), token_count=n)
+
+        def h(size, offset, score, n):
+            return RetrievedHit(
+                slice=tok(size, offset, n),
+                corpus="default",
+                score=score,
+                rank_in_size=0,
+                provenance=HitProvenance.RETRIEVED,
+            )
+
+        # A (top priority) wants an expensive parent (over budget); B wants a cheap one.
+        hits = [h(64, 0, 0.95, 64), h(64, 512, 0.90, 64)]
+        source = DictSource([tok(128, 0, 5000), tok(128, 512, 70)])
+        sel = budget_fit(hits, budget=200, counter=CharCounter(), source=source)
+        b_from = str(doc.slice_at(64, 512).ref.uuid())
+        b_trade = next(t for t in sel.trace.trade_ups if t.from_id == b_from)
+        assert b_trade.round == 1

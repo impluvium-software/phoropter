@@ -20,6 +20,11 @@ def hit(doc, size, offset, score=1.0, rank=0):
 DOC = multi_view_slice("doc-a", "x" * 1024, DEFAULT_GRID)
 
 
+def _distinct(n: int) -> str:
+    """A string whose every code point is unique, so every slice has a unique marker."""
+    return "".join(chr(0x100 + i) for i in range(n))
+
+
 class TestMinimalEdges:
     def test_full_spine_has_four_minimal_edges(self) -> None:
         # The offset-0 spine across all five sizes: 4 minimal edges (each level to
@@ -47,6 +52,15 @@ class TestMinimalEdges:
         forest = ContainmentForest.build(hits, DEFAULT_GRID)
         assert [h.slice.size for h in forest.leaves()] == [64]
         assert [h.slice.size for h in forest.roots()] == [1024]
+
+    def test_missing_middle_size_walks_up_to_the_next_ancestor(self) -> None:
+        # Retrieval returned the 64 and the 256 but not the 128 in between. The
+        # child's minimal parent is the 256 above the gap, NOT nothing. (Kills the
+        # "stop at the first missing size" mutant that would make it a root.)
+        doc = multi_view_slice("doc-a", _distinct(1024), DEFAULT_GRID)
+        forest = ContainmentForest.build([hit(doc, 64, 0), hit(doc, 256, 0)], DEFAULT_GRID)
+        assert forest.minimal_parent(doc.slice_at(64, 0).ref) == doc.slice_at(256, 0).ref
+        assert [h.slice.size for h in forest.roots()] == [256]
 
 
 class TestPositionalIdentity:
@@ -76,6 +90,41 @@ class TestPositionalIdentity:
         child = hit(DOC, 64, 0)
         assert contains(parent, child)
         assert not contains(child, parent)
+
+    def test_contains_requires_position_not_just_marker(self) -> None:
+        # Repeated text: every 64-slice shares one marker, and that marker is in
+        # every larger slice's descendant list. So marker membership alone is
+        # ALWAYS true here — contains() must still return False whenever the
+        # positions do not actually nest. (Kills the marker-alone mutant.)
+        doc = multi_view_slice("doc-a", "x" * 512, DEFAULT_GRID)
+        # 64@192 shares 64@0's marker, and that marker is inside 128@0's descendants...
+        assert doc.slice_at(64, 192).own_marker in doc.slice_at(128, 0).descendant_markers
+        # ...but 64@192 = [192,256) is disjoint from 128@0 = [0,128): NOT contained.
+        assert not contains(hit(doc, 128, 0), hit(doc, 64, 192))  # fails on the end bound
+        # 64@192 = [192,256) starts before 256@256 = [256,512): NOT contained.
+        assert not contains(hit(doc, 256, 256), hit(doc, 64, 192))  # fails on the start bound
+        # A genuine nesting, same marker regime: contained.
+        assert contains(hit(doc, 128, 0), hit(doc, 64, 64))
+
+    def test_contains_requires_marker_not_just_position(self) -> None:
+        # Positions nest, but the parent's descendant list does not vouch for the
+        # child (a stale/tampered generation) -> not contained.
+        parent = dataclasses.replace(
+            hit(DOC, 128, 0), slice=dataclasses.replace(DOC.slice_at(128, 0), descendant_markers=())
+        )
+        assert not contains(parent, hit(DOC, 64, 0))
+
+    def test_contains_boundary_straddle_is_false(self) -> None:
+        # A child that starts inside the parent but runs past its end is not
+        # contained, even with a vouching marker. Uses synthetic coordinates
+        # (a real grid never straddles) to exercise the end-bound directly.
+        doc = multi_view_slice("doc-a", "x" * 256, DEFAULT_GRID)
+        parent = hit(doc, 128, 0)  # [0, 128)
+        straddler = dataclasses.replace(
+            hit(doc, 64, 64), slice=dataclasses.replace(doc.slice_at(64, 64), codepoint_length=128)
+        )  # [64, 192): starts inside, ends past the parent
+        assert straddler.slice.own_marker in parent.slice.descendant_markers
+        assert not contains(parent, straddler)
 
 
 class TestAnomalies:

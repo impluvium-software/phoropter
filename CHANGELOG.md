@@ -7,6 +7,18 @@ may change on minor versions).
 
 ## [Unreleased]
 
+### Added
+- `docs/testing.md`: a plain-English account of how a green suite once hid a real
+  bug, the mutation-testing findings, and the principles we test by.
+
+### Changed
+- Hardened the correctness tests (Tier 1 of a mutation-testing audit): replaced
+  proxy assertions (e.g. "larger" where the claim is "contains") with the actual
+  invariants, added independent marker/descendant oracles to the slicing gate,
+  made the subsumption tests cross-document / boundary-exact / stale-aware, and
+  removed a short-circuit in the store conformance suite. Each change is verified
+  to fail against the specific mutation it guards against.
+
 ## [0.1.0] - 2026-07-10
 
 First public release. Phoropter slices documents at multiple sizes on a shared

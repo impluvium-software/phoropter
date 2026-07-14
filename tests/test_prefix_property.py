@@ -14,6 +14,7 @@ gating test; the hypothesis suite generalizes the invariants to arbitrary text
 and arbitrary valid divisibility-chain grids (nothing may assume powers of two).
 """
 
+import hashlib
 from itertools import pairwise
 
 import pytest
@@ -118,7 +119,29 @@ def assert_all_invariants(doc: SlicedDocument) -> None:
         assert running == doc.byte_length or not pieces
 
     for s in doc.slices:
-        # Descendants: exactly the closed-form enumeration, in canonical order.
+        # Independent marker oracle: recompute SHA-256 over the exact UTF-8 bytes
+        # from scratch — do NOT trust the slicer's own marker against itself. This
+        # catches a wrong byte range, a silent Unicode normalization, or a wrong
+        # text encoding, none of which a self-consistency check would notice.
+        assert s.own_marker == hashlib.sha256(s.text.encode("utf-8")).hexdigest()
+
+        # Independent positional descendant oracle: filter ALL slices by their
+        # actual spans, rather than re-running the slicer's own range() formula
+        # (which would agree with an off-by-one shared by both). A descendant is
+        # any strictly-smaller slice whose span lies within this one.
+        independent = sorted(
+            (
+                c
+                for c in doc.slices
+                if c.size < s.size
+                and s.codepoint_offset <= c.codepoint_offset
+                and c.codepoint_end <= s.codepoint_end
+            ),
+            key=lambda c: (grid.sizes.index(c.size), c.codepoint_offset),
+        )
+        assert list(s.descendant_markers) == [c.own_marker for c in independent]
+
+        # Closed-form enumeration, in canonical order (kept alongside the oracle).
         expected = []
         for child_size in grid.levels_below(s.size):
             expected.extend(
@@ -137,6 +160,31 @@ def assert_all_invariants(doc: SlicedDocument) -> None:
             small = s.text.encode("utf-8")
             assert parent.text.encode("utf-8")[: len(small)] == small
             assert s.own_marker in parent.descendant_markers
+
+
+def _distinct(n: int) -> str:
+    return "".join(chr(0x100 + i) for i in range(n))
+
+
+# Fixed nasty inputs, run deterministically every time (not just when hypothesis
+# happens to draw them), so the independent marker/descendant oracles always fire
+# on multi-slice documents, boundary-straddling multibyte, and astral-plane text.
+FIXED_DOCS = [
+    ("distinct-300", _distinct(300)),  # every slice a unique marker; interior parents
+    ("distinct-1024", _distinct(1024)),
+    ("ascii-1024", "x" * 1024),
+    ("cjk-300", "世" * 300),
+    ("emoji-300", "🙂" * 300),  # 4-byte code points
+    ("multiscript", multi_script_document(400)),
+    ("short", "hello"),  # shorter than the smallest grid size
+    ("astral-mix", ("a𐍈b🙂c世" * 50)),  # 1-, 2-, 3-, 4-byte code points interleaved
+]
+
+
+@pytest.mark.parametrize("text", [d[1] for d in FIXED_DOCS], ids=[d[0] for d in FIXED_DOCS])
+def test_invariants_on_fixed_documents(text: str) -> None:
+    assert_all_invariants(multi_view_slice("doc", text))
+    verify_prefix_property_at_offset_zero(text)
 
 
 @settings(max_examples=120, deadline=None)

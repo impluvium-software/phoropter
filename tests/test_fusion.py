@@ -63,3 +63,17 @@ def test_raw_score_pool_sorts_by_score() -> None:
     }
     fused = RawScorePool().fuse(by_size)
     assert [c.hit.slice.size for c in fused] == [1024, 64]
+
+
+def test_ragged_depth_reads_no_further_than_each_size_has() -> None:
+    # The normal case: sizes return unequal numbers of matches. Tier interleave
+    # must stop at the end of each per-size list, not read past it. (Kills the
+    # `tier < len(...)` -> `tier <= len(...)` guard mutant, which indexes off the end.)
+    by_size = {
+        64: [hit(64, 0, 0.9, 0), hit(64, 64, 0.8, 1), hit(64, 128, 0.7, 2)],
+        128: [hit(128, 0, 0.5, 0)],
+    }
+    fused = TierInterleave().fuse(by_size)
+    order = [(c.hit.slice.size, c.hit.slice.codepoint_offset) for c in fused]
+    assert order == [(64, 0), (128, 0), (64, 64), (64, 128)]
+    assert [c.fused_rank for c in fused] == [0, 1, 2, 3]

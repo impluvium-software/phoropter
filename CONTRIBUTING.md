@@ -34,6 +34,13 @@ slicer/markers — fix the gate first. The gates encode invariants that make con
 detection *exact*; a red gate means the exactness claim is broken, and every downstream
 behavior is suspect.
 
+**Write tests that can actually fail.** [docs/testing.md](docs/testing.md) explains, in
+plain English, how a green suite once hid a real bug and what we do about it: assert the
+whole invariant (not a proxy like "larger" when the claim is "contains"), use text that
+is distinct at every position (so a bug changes a value, not just a count), and check the
+code against something independent rather than against itself. Read it before adding
+tests to the slicer, forest, or selection engine.
+
 ## Static checks
 
 ```bash

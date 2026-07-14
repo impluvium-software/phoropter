@@ -41,7 +41,8 @@ budgeting a sequence of safe, explainable moves.
   [api](docs/api.md) + [`api/openapi.yaml`](api/openapi.yaml) (REST) ·
   [mcp](docs/mcp.md) · [adapters](docs/adapters.md) (SPIs) ·
   [operations](docs/operations.md) · [evaluation](docs/evaluation.md).
-- **Rationale:** [decisions](docs/decisions.md) (the design log).
+- **Rationale:** [decisions](docs/decisions.md) (the design log) ·
+  [testing](docs/testing.md) (how correctness is verified, in plain English).
 
 ## License
 

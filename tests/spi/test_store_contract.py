@@ -156,16 +156,22 @@ class TestUpsertAndSearch:
         points = _points_for("x" * 300, "doc-a", DEFAULT_GRID)
         await store.upsert_slices("docs", points, grid_fingerprint=DEFAULT_GRID.fingerprint())
 
-        probe = next(p for p in points if p.slice.size == 64)
-        hits = await store.search_size("docs", 64, probe.vector, k=5)
+        # Probe a size that HAS descendants (256), so descendant-marker fidelity is
+        # actually exercised — not short-circuited by "the 64 size has none". For a
+        # Qdrant-backed store this also verifies the marker payload codec round-trips.
+        probe = next(p for p in points if p.slice.size == 256)
+        assert probe.slice.descendant_markers, "the 256 slice must have descendants to test"
+        hits = await store.search_size("docs", 256, probe.vector, k=5)
         assert hits, "expected at least one hit"
-        top = hits[0]
-        assert top.slice.own_marker  # marker present
-        assert (
-            top.slice.descendant_markers == probe.slice.descendant_markers or top.slice.size == 64
-        )
-        assert top.slice.text
-        assert top.rank_in_size == 0
+        top = next(h for h in hits if h.slice.ref == probe.slice.ref)
+        # The stored slice must come back complete: markers, descendants, span, text.
+        assert top.slice.own_marker == probe.slice.own_marker
+        assert top.slice.descendant_markers == probe.slice.descendant_markers
+        assert top.slice.text == probe.slice.text
+        assert top.slice.codepoint_offset == probe.slice.codepoint_offset
+        assert top.slice.byte_offset == probe.slice.byte_offset
+        assert top.slice.document_codepoint_length == probe.slice.document_codepoint_length
+        assert top.rank_in_size is not None
         assert top.score is not None
 
     async def test_search_is_deterministically_ordered(self, store: VectorStoreAdapter) -> None:
